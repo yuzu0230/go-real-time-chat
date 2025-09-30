@@ -2,59 +2,85 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"log"
 	"net/url"
 	"os"
 	"os/signal"
-	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-var addr = "localhost:8080"
-var u = url.URL{Scheme: "ws", Host: addr, Path: "/echo"}
+type Client struct {
+	url  string
+	conn *websocket.Conn
+}
 
-func main() {
-	// Create a channel to receive OS interrupt signals (e.g., Ctrl+C).
-	interrupt := make(chan os.Signal, 1)
-	signal.Notify(interrupt, os.Interrupt)
+// NewClient creates a new client instance
+func NewClient(addr string) (*Client, error) {
+	u := url.URL{Scheme: "ws", Host: addr, Path: "/echo"}
+	return &Client{
+		url: u.String(),
+	}, nil
+}
 
-	log.Printf("Connecting to %s", u.String())
-
-	conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+// Connect establishes a connection to the WebSocket server.
+func (c *Client) Connect() error {
+	log.Printf("Connecting to %s", c.url)
+	conn, _, err := websocket.DefaultDialer.Dial(c.url, nil)
 	if err != nil {
-		log.Fatal("Error during dial:", err)
+		return err
 	}
-	defer conn.Close()
+	c.conn = conn
+	return nil
+}
 
-	// Create a channel that will be closed when the read goroutine ends.
-	// We use struct{} as the channel's type because we only care about the signal,
-	// not the value being sent.
+func (c *Client) Close() {
+	log.Println("Closing connection.")
+	err := c.conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(1000, ""))
+	if err != nil {
+		log.Println("Write close error:", err)
+	}
+}
+
+// Run starts the client's read and write loops.
+func (c *Client) Run() error {
+	// First, establish the connection.
+	if err := c.Connect(); err != nil {
+		return err
+	}
+	defer c.Close()
+	defer c.conn.Close() // Also ensure raw connection is closed.
+
+	// Channel to signal that the read goroutine has finished.
 	done := make(chan struct{})
 
-	// Start a goroutine to continuously read messages from the server.
+	// Start the read goroutine.
 	go func() {
 		defer close(done)
 		for {
-			_, msg, err := conn.ReadMessage()
+			_, message, err := c.conn.ReadMessage()
 			if err != nil {
-				log.Println("Error during msg reading:", err)
+				// Check for clean and unclean close messages.
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+					log.Printf("Read error: %v", err)
+				}
 				return
 			}
-			log.Printf("Received: %s", msg)
+			log.Printf("Received: %s", message)
+			fmt.Print("Enter text: ")
 		}
 	}()
 
-	// A channel to receive user input from the keyboard.
+	// A dedicated goroutine for reading stdin
 	userInputChan := make(chan string)
 	go func() {
 		reader := bufio.NewReader(os.Stdin)
 		for {
-			fmt.Print("Enter text: ")
 			text, err := reader.ReadString('\n')
 			if err != nil {
-				log.Println("Error during reading stdin:", err)
+				log.Println("Error reading stdin:", err)
 				close(userInputChan)
 				return
 			}
@@ -62,47 +88,48 @@ func main() {
 		}
 	}()
 
-	// Create a ticker that triggers every second.
-	// We can use it for heartbeats or other periodic tasks
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
+	// Channel for handling OS interrupt signals (Ctrl+C).
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt)
+	fmt.Print("Enter text: ")
 
 	for {
 		select {
 		case <-done:
-			// If the 'done' channel is closed, it means the read goroutine has finished.
-			// This could be due to a server disconnect. We exit the program.
-			log.Println("Reader goroutine finished. Exiting.")
-			return
+			// The read loop ended (e.g., server disconnected), so we exit.
+			return nil
 
 		case text := <-userInputChan:
-			// Every second, the ticker sends a value. We use this to send a message.
-			// err := conn.WriteMessage(websocket.TextMessage, []byte(t.String()))
-
-			// Send the user's message to the WebSocket server
-			err := conn.WriteMessage(websocket.TextMessage, []byte(text))
+			if text == "" { // Channel was closed
+				return nil
+			}
+			err := c.conn.WriteMessage(websocket.TextMessage, []byte(text))
 			if err != nil {
-				log.Println("Error during msg writing:", err)
-				return
+				log.Println("Write error:", err)
+				return err
 			}
 
 		case <-interrupt:
-			log.Println("Interrupt signal received. Closing connection.")
-
-			// Cleanly close the connection by sending a close message and then
-			// waiting (with timeout) for the server to close the connection.
-			err := conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-			if err != nil {
-				log.Println("Error during writing close:", err)
-				return
-			}
-
-			// Wait for the server to close the connection, with a timeout.
-			select {
-			case <-done:
-			case <-time.After(time.Second):
-			}
-			return
+			// User pressed Ctrl+C. The deferred Close() methods will be called.
+			return nil
 		}
 	}
+}
+
+func main() {
+	// Use the flag package to make the server address configurable.
+	addr := flag.String("addr", "localhost:8080", "websocket server address")
+	flag.Parse()
+
+	client, err := NewClient(*addr)
+	if err != nil {
+		log.Fatalf("Error creating client: %v", err)
+	}
+
+	// Run the client. This will block until the client is done.
+	if err := client.Run(); err != nil {
+		log.Fatalf("Client run error: %v", err)
+	}
+
+	log.Println("Client finished.")
 }
